@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Shams Charania (@ShamsCharania)</title>
+    <link>https://x.com/ShamsCharania</link>
+    <description>Тестовая лента в формате RSSHub /twitter/user для проверки парсера</description>
+    <item>
+      <title>BREAKING: The Oklahoma City Thunder are trading guard Josh Giddey…</title>
+      <link>https://x.com/ShamsCharania/status/1855000000000000001</link>
+      <guid isPermaLink="false">1855000000000000001</guid>
+      <pubDate>Thu, 30 Oct 2026 14:32:00 +0000</pubDate>
+      <description><![CDATA[BREAKING: The Oklahoma City Thunder are trading guard Josh Giddey to the Chicago Bulls for guard Alex Caruso, sources tell ESPN. Full story: https://x.com/ShamsCharania/status/1855000000000000001 <a href="https://x.com/hashtag/NBA">#NBA</a>]]></description>
+      <media:content url="https://pbs.twimg.com/media/Gtestimg01.jpg" type="image/jpeg" medium="image"/>
+    </item>
+    <item>
+      <title>Free agent guard Marcus Smart has agreed to a two-year, $21M deal…</title>
+      <link>https://x.com/ShamsCharania/status/1855000000000000002</link>
+      <guid isPermaLink="false">1855000000000000002</guid>
+      <pubDate>Thu, 30 Oct 2026 16:05:00 +0000</pubDate>
+      <description><![CDATA[Free agent guard Marcus Smart has agreed to a two-year, $21 million deal with the Los Angeles Lakers, sources tell ESPN. Smart had offers from multiple contenders but chose Los Angeles. <a href="https://x.com/hashtag/LakeShow">#LakeShow</a>]]></description>
+      <media:content url="https://pbs.twimg.com/media/Gtestimg02.png" type="image/png" medium="image"/>
+      <media:content url="https://pbs.twimg.com/media/Gtestimg03.jpg" type="image/jpeg" medium="image"/>
+    </item>
+    <item>
+      <title>RT @wojespn: Mavericks star Luka Doncic is out 4-to-6 weeks…</title>
+      <link>https://x.com/ShamsCharania/status/1855000000000000003</link>
+      <guid isPermaLink="false">1855000000000000003</guid>
+      <pubDate>Thu, 30 Oct 2026 17:20:00 +0000</pubDate>
+      <description><![CDATA[RT @wojespn: Mavericks star Luka Doncic is out 4-to-6 weeks with a right calf strain, sources tell ESPN.]]></description>
+    </item>
+  </channel>
+</rss>

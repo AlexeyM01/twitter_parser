@@ -1,0 +1,11 @@
+# Секреты — не коммитить!
+.env
+*.session
+*.session-journal
+
+__pycache__/
+*.pyc
+
+venv/
+
+# state.json коммитится намеренно (состояние между запусками Actions)

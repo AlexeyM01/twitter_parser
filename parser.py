@@ -89,7 +89,7 @@ class Config:
     rsshub_instances: list = field(
         default_factory=lambda: [
             i.strip().rstrip("/")
-            for i in os.getenv("RSSHUB_INSTANCES", DEFAULT_INSTANCES).split(",")
+            for i in (os.getenv("RSSHUB_INSTANCES", "").strip() or DEFAULT_INSTANCES).split(",")
             if i.strip()
         ]
     )
@@ -223,7 +223,7 @@ def _fetch_url(url: str, timeout: int = 25) -> Optional[bytes]:
 
 
 def fetch_feed() -> tuple:
-    """Пробует источники по очереди. Возвращает (посты, url источника)."""
+    """Пробует источники по очереди. Возвращает (посты, url источника, список источников)."""
     sources: list = []
     if CFG.custom_rss_url:
         sources.append(CFG.custom_rss_url)
@@ -241,9 +241,9 @@ def fetch_feed() -> tuple:
         posts = [p for p in (entry_to_post(e) for e in entries) if p]
         if posts:
             log.info("Получено %d записей из %s", len(posts), url)
-            return posts, url
+            return posts, url, sources
         log.warning("Источник %s отдал %d записей, но без валидных твитов", url, len(entries))
-    return [], ""
+    return [], "", sources
 
 
 def fetch_feed_from_file(path: str) -> tuple:
@@ -488,22 +488,15 @@ def _send_bot_one(token: str, chat_id: str, msg: str, images: list) -> None:
     raise RuntimeError("Не удалось отправить сообщение после 3 попыток")
 
 
-def send_via_bot(outbox: list) -> None:
-    token = CFG.bot_token
-    me = _bot_api(token, "getMe")
-    log.info("Telegram Bot API: бот @%s", me.get("username"))
-
-    for msg, images in outbox:
-        if images:
-            try:
-                _send_bot_one(token, CFG.channel, msg, images)
-            except BotError as exc:
-                log.warning("Альбом не отправился (%s) — публикую только текст", exc)
-                _send_bot_one(token, CFG.channel, msg, [])
-        else:
-            _send_bot_one(token, CFG.channel, msg, [])
-        log.info("Опубликовано (%d фото): %.60s…", len(images), msg.replace("\n", " "))
-        time.sleep(3)  # антиспам-пауза между постами
+def _publish_bot_item(token: str, msg: str, images: list) -> None:
+    """Один пост ботом: альбом или текст, с фолбэком на текст при сбое альбома."""
+    if images:
+        try:
+            _send_bot_one(token, CFG.channel, msg, images)
+            return
+        except BotError as exc:
+            log.warning("Альбом не отправился (%s) — публикую только текст", exc)
+    _send_bot_one(token, CFG.channel, msg, [])
 
 
 # ----------------------------------------------------------------------------
@@ -540,23 +533,6 @@ async def _send_with_retry(client, channel, msg: str, images: list) -> None:
     raise RuntimeError("Не удалось отправить сообщение после 3 попыток")
 
 
-async def send_to_telegram(outbox: list) -> None:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-
-    entity = int(CFG.channel) if re.fullmatch(r"-?\d+", CFG.channel) else CFG.channel
-    async with TelegramClient(StringSession(CFG.session), CFG.api_id, CFG.api_hash) as client:
-        me = await client.get_me()
-        log.info("Telegram: вошли как @%s (id %s)", getattr(me, "username", None), me.id)
-        channel = await client.get_entity(entity)
-        log.info("Канал: %s", getattr(channel, "title", entity))
-
-        for msg, images in outbox:
-            await _send_with_retry(client, channel, msg, images)
-            log.info("Опубликовано (%d фото): %.60s…", len(images), msg.replace("\n", " "))
-            await asyncio.sleep(3)  # антиспам-пауза между постами
-
-
 # ----------------------------------------------------------------------------
 # Основной цикл
 # ----------------------------------------------------------------------------
@@ -570,6 +546,23 @@ def print_outbox(outbox: list) -> None:
             print(f"[картинки: {', '.join(p.name for p in images)}]")
 
 
+def _prepare_item(post: Post, tr: Translator, tmpdir: Path) -> tuple:
+    """Перевод + скачивание картинок + сборка сообщения для одного твита."""
+    translated = tr.translate(post.text)
+    images = download_images(post.images, tmpdir) if post.images else []
+    return build_message(post, translated), images
+
+
+def mark_sent(state: dict, post: Post) -> None:
+    """Фиксирует твит в state.json сразу после успешной публикации:
+    если следующий пост упадёт с ошибкой, уже отправленные не уйдут повторно."""
+    ids = set(state.get("posted_ids") or [])
+    ids.add(post.pid)
+    state["posted_ids"] = sorted(ids)[-500:]
+    state["last_run"] = datetime.now(timezone.utc).isoformat()
+    save_state(state)
+
+
 async def main() -> int:
     logging.basicConfig(
         level=logging.DEBUG if CFG.dry_run else logging.INFO,
@@ -578,18 +571,29 @@ async def main() -> int:
     )
 
     # --- 1. Получаем ленту -------------------------------------------------
+    tried: list = []
     if CFG.test_feed:
         posts, source = fetch_feed_from_file(CFG.test_feed)
     else:
-        posts, source = fetch_feed()
+        posts, source, tried = fetch_feed()
 
     if not posts:
-        log.error("Не удалось получить ленту ни из одного источника. "
-                  "Проверьте RSSHUB_INSTANCES / CUSTOM_RSS_URL (см. README, раздел 6).")
+        log.error(
+            "Не удалось получить ленту ни из одного источника (%d шт.):\n  - %s\n"
+            "Что делать: у публичных инстансов RSSHub Twitter-роут почти всегда отключён.\n"
+            "Настройте свой RSSHub (README, шаг 5, ~10 минут) и укажите его URL\n"
+            "в Variable CUSTOM_RSS_URL (Settings -> Secrets and variables -> Actions).",
+            len(tried), "\n  - ".join(tried) or "(нет источников)",
+        )
         return 1
 
     now = datetime.now(timezone.utc)
-    fresh = [p for p in posts if now - p.published <= timedelta(hours=CFG.max_age_hours)]
+    # В тестовом режиме (TEST_FEED) возраст не фильтруем — sample_feed.xml
+    # должен показывать все записи, когда бы его ни запустили
+    if CFG.test_feed:
+        fresh = list(posts)
+    else:
+        fresh = [p for p in posts if now - p.published <= timedelta(hours=CFG.max_age_hours)]
     if CFG.skip_retweets:
         fresh = [p for p in fresh if not p.is_retweet]
     log.info("Свежих постов (<= %dч, без ретвитов): %d из %d",
@@ -646,24 +650,38 @@ async def main() -> int:
 
     tr = Translator(CFG.translator, CFG.deepl_api_key)
     tmpdir = Path(tempfile.mkdtemp(prefix="shams2tg_"))
-    outbox: list = []
-    for post in new:
-        translated = tr.translate(post.text)
-        images = download_images(post.images, tmpdir) if post.images else []
-        outbox.append((build_message(post, translated), images))
+    sent = 0
 
     if bot_mode:
-        send_via_bot(outbox)
+        me = _bot_api(CFG.bot_token, "getMe")
+        log.info("Telegram Bot API: бот @%s", me.get("username"))
+        for post in new:
+            msg, images = _prepare_item(post, tr, tmpdir)
+            _publish_bot_item(CFG.bot_token, msg, images)
+            mark_sent(state, post)  # state пишем после КАЖДОГО твита:
+            sent += 1               # сбой следующего не вызовет повторов
+            log.info("Опубликовано (%d фото): %.60s…", len(images), msg.replace("\n", " "))
+            time.sleep(3)  # антиспам-пауза между постами
     else:
-        await send_to_telegram(outbox)
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
 
-    # --- 5. Фиксируем отправленное ------------------------------------------
-    posted_ids |= {p.pid for p in new}
-    state["posted_ids"] = sorted(posted_ids)[-500:]
-    state["last_run"] = now.isoformat()
-    save_state(state)
+        entity = int(CFG.channel) if re.fullmatch(r"-?\d+", CFG.channel) else CFG.channel
+        async with TelegramClient(StringSession(CFG.session), CFG.api_id, CFG.api_hash) as client:
+            me = await client.get_me()
+            log.info("Telegram: вошли как @%s (id %s)", getattr(me, "username", None), me.id)
+            channel = await client.get_entity(entity)
+            log.info("Канал: %s", getattr(channel, "title", entity))
+            for post in new:
+                msg, images = _prepare_item(post, tr, tmpdir)
+                await _send_with_retry(client, channel, msg, images)
+                mark_sent(state, post)
+                sent += 1
+                log.info("Опубликовано (%d фото): %.60s…", len(images), msg.replace("\n", " "))
+                await asyncio.sleep(3)
+
     log.info("Готово: опубликовано %d, всего в истории %d id",
-             len(new), len(state["posted_ids"]))
+             sent, len(state["posted_ids"]))
     return 0
 
 

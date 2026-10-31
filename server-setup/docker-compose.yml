@@ -1,0 +1,35 @@
+# RSSHub — источник RSS-ленты X (Twitter) для парсера.
+# Кладётся рядом с .env (в нём TWITTER_AUTH_TOKEN) и запускается: docker compose up -d
+# Справочник: server-setup/server-guide.md
+
+services:
+  rsshub:
+    image: diygod/rsshub:latest
+    container_name: rsshub
+    restart: always          # автозапуск после перезагрузки сервера
+    ports:
+      - "1200:1200"
+    env_file:
+      - .env                 # переменные из .env передаются в контейнер
+    environment:
+      NODE_ENV: production
+      CACHE_EXPIRE: 600          # кэш ленты, сек
+      CACHE_CONTENT_EXPIRE: 3600 # кэш контента, сек
+
+  # --- ОПЦИОНАЛЬНО: защита ленты паролем (basic auth) ------------------------
+  # Раскомментируйте, чтобы чужие люди не могли дёргать ваш инстанс.
+  # Шаги: 1) docker run --rm -it caddy:2 caddy hash-password
+  #          -> введите пароль, скопируйте хэш
+  #       2) создайте Caddyfile (см. server-guide.md, раздел 7)
+  #       3) docker compose up -d
+  #       4) закройте порт 1200 в firewall, в GitHub используйте порт 1201:
+  #          http://rss:ВАШ_ПАРОЛЬ@IP_СЕРВЕРА:1201/twitter/user/ShamsCharania
+  #
+  # caddy:
+  #   image: caddy:2
+  #   container_name: caddy
+  #   restart: always
+  #   ports:
+  #     - "1201:1201"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro

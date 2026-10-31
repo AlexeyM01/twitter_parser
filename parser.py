@@ -7,7 +7,8 @@ Shams Charania (x.com/ShamsCharania) -> Telegram-канал.
   1. Берёт RSS-ленту профиля через RSSHub (список инстансов с fallback)
      или через CUSTOM_RSS_URL (свой RSSHub / любой совместимый RSS).
   2. Находит новые посты (state.json), переводит на русский, скачивает картинки.
-  3. Публикует в канал через Telethon (MTProto, сессия вашего аккаунта).
+  3. Публикует в канал через Bot API (токен бота от @BotFather — основной режим,
+    my.telegram.org не нужен) или через Telethon (если задан TELEGRAM_SESSION).
   4. Обновляет state.json (GitHub Actions коммитит его обратно в репозиторий).
 
 Запуск:
@@ -95,6 +96,9 @@ class Config:
     custom_rss_url: str = os.getenv("CUSTOM_RSS_URL", "").strip()
     test_feed: str = os.getenv("TEST_FEED", "").strip()
 
+    # Основной режим: бот (токен выдаёт @BotFather прямо в Telegram)
+    bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    # Опциональный режим: личный аккаунт через MTProto (нужен my.telegram.org)
     api_id: int = _env_int("TELEGRAM_API_ID", 0)
     api_hash: str = os.getenv("TELEGRAM_API_HASH", "").strip()
     session: str = os.getenv("TELEGRAM_SESSION", "").strip()
@@ -410,7 +414,100 @@ def download_images(urls: list, tmpdir: Path) -> list:
 
 
 # ----------------------------------------------------------------------------
-# Telegram (Telethon)
+# Telegram, режим 1 (основной): Bot API, токен от @BotFather
+# ----------------------------------------------------------------------------
+
+
+class BotError(Exception):
+    """Ошибка Telegram Bot API."""
+
+
+class BotFlood(Exception):
+    def __init__(self, retry_after: int):
+        super().__init__(f"FloodWait {retry_after}s")
+        self.retry_after = retry_after
+
+
+def _bot_api(token: str, method: str, data: dict = None, files: dict = None,
+             timeout: int = 90):
+    """Вызов метода Bot API. Возвращает result или бросает BotError/BotFlood."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        r = requests.post(url, data=data, files=files, timeout=timeout)
+    except requests.RequestException as exc:
+        raise BotError(f"сеть: {exc}")
+    try:
+        payload = r.json()
+    except ValueError:
+        payload = {"ok": False, "error_code": r.status_code, "description": r.text[:200]}
+    if payload.get("ok"):
+        return payload.get("result")
+    if payload.get("error_code") == 429:
+        retry_after = int(payload.get("parameters", {}).get("retry_after", 5))
+        raise BotFlood(retry_after)
+    raise BotError(f"{payload.get('error_code')}: {payload.get('description', '')}")
+
+
+def _send_bot_one(token: str, chat_id: str, msg: str, images: list) -> None:
+    """Одно сообщение (альбом картинок или текст) с ретраями и учётом FloodWait."""
+    for attempt in range(3):
+        try:
+            if images:
+                # Подпись (≤1024) кладём в первый элемент альбома
+                media = [{"type": "photo", "media": f"attach://img{i}"}
+                         for i in range(len(images))]
+                if len(msg) <= CAPTION_LIMIT:
+                    media[0]["caption"] = msg
+                    media[0]["parse_mode"] = "HTML"
+                files = {f"img{i}": (p.name, p.read_bytes())
+                         for i, p in enumerate(images)}
+                result = _bot_api(token, "sendMediaGroup",
+                                  data={"chat_id": chat_id,
+                                        "media": json.dumps(media)},
+                                  files=files)
+                if len(msg) > CAPTION_LIMIT:  # длинный текст — ответом на альбом
+                    _bot_api(token, "sendMessage",
+                             data={"chat_id": chat_id, "text": msg,
+                                   "parse_mode": "HTML",
+                                   "reply_to_message_id": result[0]["message_id"]})
+            else:
+                _bot_api(token, "sendMessage",
+                         data={"chat_id": chat_id, "text": msg,
+                               "parse_mode": "HTML"})
+            return
+        except BotFlood as exc:
+            log.warning("FloodWait от Telegram: сплю %dс (попытка %d)",
+                        exc.retry_after + 2, attempt + 1)
+            time.sleep(exc.retry_after + 2)
+        except BotError as exc:
+            if attempt < 2:
+                log.warning("Bot API: %s, повтор через 5с (попытка %d)", exc, attempt + 1)
+                time.sleep(5)
+            else:
+                raise
+    raise RuntimeError("Не удалось отправить сообщение после 3 попыток")
+
+
+def send_via_bot(outbox: list) -> None:
+    token = CFG.bot_token
+    me = _bot_api(token, "getMe")
+    log.info("Telegram Bot API: бот @%s", me.get("username"))
+
+    for msg, images in outbox:
+        if images:
+            try:
+                _send_bot_one(token, CFG.channel, msg, images)
+            except BotError as exc:
+                log.warning("Альбом не отправился (%s) — публикую только текст", exc)
+                _send_bot_one(token, CFG.channel, msg, [])
+        else:
+            _send_bot_one(token, CFG.channel, msg, [])
+        log.info("Опубликовано (%d фото): %.60s…", len(images), msg.replace("\n", " "))
+        time.sleep(3)  # антиспам-пауза между постами
+
+
+# ----------------------------------------------------------------------------
+# Telegram, режим 2 (опционально): Telethon, личный аккаунт (my.telegram.org)
 # ----------------------------------------------------------------------------
 
 
@@ -539,9 +636,12 @@ async def main() -> int:
         new = new[-CFG.max_posts_per_run:]
 
     # --- 4. Перевод, медиа, отправка ----------------------------------------
-    if not (CFG.api_id and CFG.api_hash and CFG.session and CFG.channel):
-        log.error("Не заданы TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_SESSION / "
-                  "TELEGRAM_CHANNEL. Заполните их (см. .env.example).")
+    bot_mode = bool(CFG.bot_token)
+    telethon_mode = bool(CFG.api_id and CFG.api_hash and CFG.session)
+    if not CFG.channel or not (bot_mode or telethon_mode):
+        log.error("Нужно задать TELEGRAM_BOT_TOKEN + TELEGRAM_CHANNEL (основной режим, "
+                  "токен бота от @BotFather) ИЛИ TELEGRAM_API_ID/TELEGRAM_API_HASH/"
+                  "TELEGRAM_SESSION + TELEGRAM_CHANNEL (режим личного аккаунта).")
         return 2
 
     tr = Translator(CFG.translator, CFG.deepl_api_key)
@@ -552,7 +652,10 @@ async def main() -> int:
         images = download_images(post.images, tmpdir) if post.images else []
         outbox.append((build_message(post, translated), images))
 
-    await send_to_telegram(outbox)
+    if bot_mode:
+        send_via_bot(outbox)
+    else:
+        await send_to_telegram(outbox)
 
     # --- 5. Фиксируем отправленное ------------------------------------------
     posted_ids |= {p.pid for p in new}

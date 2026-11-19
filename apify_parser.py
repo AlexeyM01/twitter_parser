@@ -1,7 +1,9 @@
 import html
+import json
 import os
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 from apify_client import ApifyClient
@@ -12,7 +14,23 @@ ACTOR_ID: str = os.getenv("ACTOR_ID", "").strip()
 TG_BOT_TOKEN: str = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID: str = os.getenv("TG_CHAT_ID", "").strip()
 
+# Прокси: если задан — весь исходящий трафик идёт через него;
+# если НЕ задан — системные прокси (реестр Windows / HTTP_PROXY) полностью игнорируются.
+# Формат: http://127.0.0.1:10809 или socks5://127.0.0.1:1080
+PROXY_URL: str = os.getenv("PROXY_URL", "").strip()
+
+# Ретраи и таймауты
+MAX_RETRIES = 3          # попыток на запрос (Telegram, syndication, скачивание медиа)
+RETRY_DELAY_SEC = 5      # пауза между попытками
+
 SENT_IDS_FILE = "sent_tweets.txt"
+STATE_FILE = "parser_state.json"  # хранит время последнего успешного запуска
+
+# === Настройки расписания (согласованы с systemd-таймером каждые 10 минут) ===
+RUN_INTERVAL_MIN = 10       # период запуска парсера
+OVERLAP_MIN = 2             # перекрытие окна — защита от твитов, опубликованных на границе запусков
+MAX_LOOKBACK_MIN = 360      # потолок «догоняющего» окна после простоя (6 часов), чтобы не спамить старьем
+FIRST_RUN_WINDOW_MIN = 15   # окно самого первого запуска (пока нет файла состояния)
 
 # Глобальная сессия для сохранения cookies и заголовков между запросами
 SESSION = requests.Session()
@@ -21,6 +39,33 @@ SESSION.headers.update({
     "Accept": "image/*,video/*,*/*",
     "Referer": "https://x.com/",
 })
+
+# --- Управление прокси ---
+if PROXY_URL:
+    # Явный прокси из .env — используем его для всех запросов
+    SESSION.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    print(f"🌐 Исходящий трафик через прокси: {PROXY_URL}")
+else:
+    # Ничего не задано — игнорируем системные прокси-настройки.
+    # Это спасает VPS от случайного подхвата окружения и делает поведение детерминированным.
+    SESSION.trust_env = False
+    print("🌐 Работаем без прокси (системные прокси-настройки игнорируются)")
+
+
+def request_with_retry(method, url, retries=MAX_RETRIES, delay=RETRY_DELAY_SEC, **kwargs):
+    """Обёртка с ретраями поверх сессии. Возвращает response или выбрасывает исключение."""
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = SESSION.request(method, url, **kwargs)
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            kind = "ProxyError — проверь прокси/VPN" if isinstance(e, requests.exceptions.ProxyError) else type(e).__name__
+            print(f"  ⚠ Попытка {attempt}/{retries} не удалась ({kind})")
+            if attempt < retries:
+                time.sleep(delay)
+    raise last_exc
 
 # Маппинг MIME-типов в расширения файлов
 MIME_TO_EXT = {
@@ -46,6 +91,57 @@ def load_sent_ids():
 def save_sent_id(tweet_id):
     with open(SENT_IDS_FILE, "a", encoding="utf-8") as f:
         f.write(f"{tweet_id}\n")
+
+    # Периодическая обрезка файла, чтобы он рос бесконечно (~1 МБ ≈ 100 тыс. ID)
+    try:
+        if os.path.getsize(SENT_IDS_FILE) > 1_000_000:
+            with open(SENT_IDS_FILE, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            with open(SENT_IDS_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines[-20_000:]) + "\n")
+    except OSError:
+        pass
+
+
+def load_last_run_ts():
+    """Возвращает время последнего УСПЕШНОГО запуска (epoch) или None."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return float(json.load(f).get("last_success_ts"))
+    except (FileNotFoundError, ValueError, KeyError, OSError):
+        return None
+
+
+def save_last_run_ts(ts=None):
+    """Фиксирует успешный запуск. Вызывается ТОЛЬКО после успешной выборки из Apify."""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"last_success_ts": ts if ts is not None else time.time()}, f)
+
+
+def compute_since_time():
+    """
+    Вычисляет sinceTime для текущего запуска.
+
+    Логика:
+      - первый запуск (нет состояния): окно FIRST_RUN_WINDOW_MIN минут;
+      - обычный запуск: от последнего успешного запуска минус OVERLAP_MIN перекрытия;
+      - после долгого простоя: не дальше MAX_LOOKBACK_MIN минут назад,
+        чтобы одним махом не залить в канал сотни старых постов
+        (лимит maxItems всё равно срежет лишнее).
+    """
+    now = datetime.now(timezone.utc)
+    last_ts = load_last_run_ts()
+
+    if last_ts is None:
+        since = now - timedelta(minutes=FIRST_RUN_WINDOW_MIN)
+    else:
+        since = datetime.fromtimestamp(last_ts, tz=timezone.utc) - timedelta(minutes=OVERLAP_MIN)
+        floor = now - timedelta(minutes=MAX_LOOKBACK_MIN)
+        if since < floor:
+            since = floor
+
+    print(f"⏱ Окно выборки: с {since.strftime('%Y-%m-%dT%H:%M:%SZ')} (текущее UTC: {now.strftime('%H:%M:%S')})")
+    return since.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def get_extension_from_content_type(content_type):
@@ -125,7 +221,7 @@ def fetch_media_via_syndication(tweet_id):
     """
     url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=x&lang=ru"
     try:
-        resp = SESSION.get(url, timeout=15)
+        resp = request_with_retry("GET", url, timeout=20)
         if resp.status_code != 200:
             print(f"  ⚠️ Syndication API вернул {resp.status_code}")
             return None, None
@@ -161,7 +257,7 @@ def resolve_tco_url(short_url):
     поэтому используем GET со stream=True.
     """
     try:
-        resp = SESSION.get(short_url, stream=True, allow_redirects=True, timeout=15)
+        resp = request_with_retry("GET", short_url, stream=True, allow_redirects=True, timeout=15)
         real_url = str(resp.url)
         resp.close()  # не скачиваем тело ответа
 
@@ -196,7 +292,7 @@ def download_media(url, media_type_hint):
 
     try:
         print("  📥 Загрузка файла...")
-        response = SESSION.get(real_url, timeout=30)
+        response = request_with_retry("GET", real_url, timeout=30)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "")
@@ -240,6 +336,10 @@ def download_media(url, media_type_hint):
 
 
 def send_telegram_message(text, media_path=None, media_type="photo"):
+    """
+    Отправляет пост в Telegram. Возвращает True при успехе, False при ошибке.
+    При ошибке отправки медиа делает fallback на текст.
+    """
     base_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
     # Обрезка подписи до лимита Telegram (1024 символа)
@@ -264,19 +364,18 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
                     "caption": caption,
                     "parse_mode": "HTML",
                 }
-                resp = requests.post(endpoint, data=data, files=files, timeout=60)
+                resp = request_with_retry("POST", endpoint, data=data, files=files, timeout=90)
 
             if resp.ok:
                 print("  ✅ Медиа успешно отправлено!")
-            else:
-                print(f"  ❌ Telegram API ошибка: {resp.status_code} — {resp.text[:300]}")
-                # fallback: отправим текстом, чтобы пост не потерялся
-                send_telegram_message(text, None)
-                return
+                return True
+
+            print(f"  ❌ Telegram API ошибка: {resp.status_code} — {resp.text[:300]}")
+            # fallback: отправим текстом, чтобы пост не потерялся
+            return send_telegram_message(text, None)
         except Exception as e:
-            print(f"  ❌ Ошибка отправки: {e}")
-            send_telegram_message(text, None)
-            return
+            print(f"  ❌ Ошибка отправки медиа: {type(e).__name__}: {e}")
+            return send_telegram_message(text, None)
         finally:
             # Удаляем временный файл после попытки отправки
             try:
@@ -292,11 +391,16 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
         }
-        resp = requests.post(f"{base_url}/sendMessage", data=payload, timeout=30)
-        if not resp.ok:
-            print(f"  ❌ Telegram API: {resp.text[:300]}")
-        else:
+        try:
+            resp = request_with_retry("POST", f"{base_url}/sendMessage", data=payload, timeout=60)
+            if not resp.ok:
+                print(f"  ❌ Telegram API: {resp.status_code} — {resp.text[:300]}")
+                return False
             print("  ✅ Текст отправлен")
+            return True
+        except Exception as e:
+            print(f"  ❌ Ошибка отправки: {type(e).__name__}: {e}")
+            return False
 
 
 def resolve_media(item, tweet_id):
@@ -324,13 +428,14 @@ def run_parser():
     client = ApifyClient(APIFY_TOKEN)
     sent_ids = load_sent_ids()
 
+    # Окно выборки считается от последнего УСПЕШНОГО запуска (см. compute_since_time)
     run_input = {
         "twitterHandles": ["NBA", "ShamsCharania", "TheDunkCentral"],
         "translateTo": "ru",
-        "maxItems": 100,
+        "maxItems": 50,
         "queryType": "Latest",
         "maxItemsPerTarget": 5,
-        "sinceTime": "2026-11-11T16:00:00Z",
+        "sinceTime": compute_since_time(),
     }
 
     print("🚀 Запускаем скрапер в Apify...")
@@ -339,38 +444,59 @@ def run_parser():
     dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
     print(f"📦 Получено {len(dataset_items)} элементов\n")
 
-    for item in reversed(dataset_items):
-        author = item.get("author", {}).get("name", "Unknown") if isinstance(item.get("author"), dict) else "Unknown"
-        text = item.get("text")
-        tweet_id = str(item.get("id"))
+    # Выборка прошла успешно — фиксируем время этого запуска как опорное.
+    # Если упадёт ниже (сеть/Telegram), твиты уже записаны в sent_ids и не задублируются,
+    # а следующий запуск перекроет окно на OVERLAP_MIN минут назад.
+    save_last_run_ts()
 
-        if not tweet_id or tweet_id in sent_ids:
+    for item in reversed(dataset_items):
+        try:
+            process_tweet(item, sent_ids)
+        except Exception as e:
+            # Один проблемный твит не должен останавливать весь запуск
+            print(f"❌ Ошибка обработки твита {item.get('id')}: {type(e).__name__}: {e}\n")
             continue
 
-        tweet_url = item.get("url") or f"https://x.com/{author}/status/{tweet_id}"
-        safe_text = html.escape(text or "")
 
-        formatted_post = (
-            f"🐦 <b>Новый пост от @{html.escape(author)}</b>\n\n"
-            f"{safe_text}\n\n"
-            f"🔗 <a href='{tweet_url}'>Открыть оригинал в X</a>"
-        )
+def process_tweet(item, sent_ids):
+    author = item.get("author", {}).get("name", "Unknown") if isinstance(item.get("author"), dict) else "Unknown"
+    text = item.get("text")
+    tweet_id = str(item.get("id"))
 
-        print(f"\n=== Твит {tweet_id} ===")
-        media_url, media_type = resolve_media(item, tweet_id)
+    if not tweet_id or tweet_id in sent_ids:
+        return
 
-        media_path = None
-        if media_url:
-            print(f"🖼️  Медиа: {media_type}")
-            media_path = download_media(media_url, media_type)
-        else:
-            print("📝 Твит без доступного медиа")
+    tweet_url = item.get("url") or f"https://x.com/{author}/status/{tweet_id}"
+    safe_text = html.escape(text or "")
 
-        send_telegram_message(formatted_post, media_path, media_type or "photo")
+    formatted_post = (
+        f"🐦 <b>Новый пост от @{html.escape(author)}</b>\n\n"
+        f"{safe_text}\n\n"
+        f"🔗 <a href='{tweet_url}'>Открыть оригинал в X</a>"
+    )
+
+    print(f"\n=== Твит {tweet_id} ===")
+    media_url, media_type = resolve_media(item, tweet_id)
+
+    media_path = None
+    if media_url:
+        print(f"🖼️  Медиа: {media_type}")
+        media_path = download_media(media_url, media_type)
+    else:
+        print("📝 Твит без доступного медиа")
+
+    sent_ok = send_telegram_message(formatted_post, media_path, media_type or "photo")
+
+    if sent_ok:
+        # ID сохраняем ТОЛЬКО после успешной отправки.
+        # Если упало (сеть/прокси/Telegram) — не сохраняем, и следующий запуск
+        # (окно перекрывается на OVERLAP_MIN) повторит попытку.
         save_sent_id(tweet_id)
         print(f"✅ Обработан твит {tweet_id}\n")
+    else:
+        print(f"⏳ Твит {tweet_id} НЕ отправлен — повторим при следующем запуске\n")
 
-        time.sleep(2)
+    time.sleep(2)
 
 
 if __name__ == "__main__":

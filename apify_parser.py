@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import requests
 from apify_client import ApifyClient
@@ -129,16 +129,15 @@ def compute_since_time():
         чтобы одним махом не залить в канал сотни старых постов
         (лимит maxItems всё равно срежет лишнее).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     last_ts = load_last_run_ts()
 
     if last_ts is None:
         since = now - timedelta(minutes=FIRST_RUN_WINDOW_MIN)
     else:
-        since = datetime.fromtimestamp(last_ts, tz=timezone.utc) - timedelta(minutes=OVERLAP_MIN)
+        since = datetime.fromtimestamp(last_ts, tz=UTC) - timedelta(minutes=OVERLAP_MIN)
         floor = now - timedelta(minutes=MAX_LOOKBACK_MIN)
-        if since < floor:
-            since = floor
+        since = max(since, floor)
 
     print(f"⏱ Окно выборки: с {since.strftime('%Y-%m-%dT%H:%M:%SZ')} (текущее UTC: {now.strftime('%H:%M:%S')})")
     return since.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -245,7 +244,7 @@ def fetch_media_via_syndication(tweet_id):
             return photo_url, "photo"
 
         return None, None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  ❌ Ошибка syndication API: {e}")
         return None, None
 
@@ -317,7 +316,7 @@ def download_media(url, media_type_hint):
             return None
 
         # Сохранение во временный файл
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)  # noqa: SIM115
         temp_file.write(response.content)
         temp_file.close()
 

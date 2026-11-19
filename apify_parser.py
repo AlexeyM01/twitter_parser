@@ -441,7 +441,7 @@ def run_parser():
     print("🚀 Запускаем скрапер в Apify...")
     run = client.actor(ACTOR_ID).call(run_input=run_input)
 
-    dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
+    dataset_items = client.dataset(run.default_dataset_id).list_items().items
     print(f"📦 Получено {len(dataset_items)} элементов\n")
 
     # Выборка прошла успешно — фиксируем время этого запуска как опорное.

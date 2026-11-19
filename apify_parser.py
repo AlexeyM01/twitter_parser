@@ -265,7 +265,7 @@ def resolve_tco_url(short_url):
             print(f"  ⚠️ Не удалось разрешить ссылку {short_url}")
             return None
         return real_url
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  ❌ Ошибка разрешения ссылки: {e}")
         return None
 
@@ -329,7 +329,7 @@ def download_media(url, media_type_hint):
     except requests.exceptions.Timeout:
         print("  ❌ Таймаут загрузки")
         return None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  ❌ Ошибка загрузки: {type(e).__name__}: {e}")
         return None
 
@@ -372,7 +372,7 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
             print(f"  ❌ Telegram API ошибка: {resp.status_code} — {resp.text[:300]}")
             # fallback: отправим текстом, чтобы пост не потерялся
             return send_telegram_message(text, None)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  ❌ Ошибка отправки медиа: {type(e).__name__}: {e}")
             return send_telegram_message(text, None)
         finally:
@@ -397,7 +397,7 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
                 return False
             print("  ✅ Текст отправлен")
             return True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  ❌ Ошибка отправки: {type(e).__name__}: {e}")
             return False
 
@@ -451,7 +451,7 @@ def run_parser():
     for item in reversed(dataset_items):
         try:
             process_tweet(item, sent_ids)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             # Один проблемный твит не должен останавливать весь запуск
             print(f"❌ Ошибка обработки твита {item.get('id')}: {type(e).__name__}: {e}\n")
             continue

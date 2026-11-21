@@ -30,6 +30,7 @@ from config import (
     RESOLVE_TCO_TIMEOUT,
     RETRY_DELAY_SEC,
     SENT_IDS_FILE,
+    SKIP_REPLIES,
     STATE_FILE,
     SYNDICATION_TIMEOUT,
     TCO_RE,
@@ -618,6 +619,7 @@ def run_parser():
         "duplicates": 0,     # пропущены как уже отправленные
         "new_tweets": 0,     # новых (не в sent_ids)
         "filtered": 0,       # отфильтрованы по стоп-фразам
+        "replies": 0,        # пропущены как ответы (реплаи)
         "sent_album": 0,     # отправлено альбомом (2+ медиа)
         "sent_single": 0,    # отправлено с одиночным медиа
         "sent_text": 0,      # отправлено только текстом
@@ -642,6 +644,7 @@ def run_parser():
         f" | дублей пропущено {stats['duplicates']}"
         f" | новых {stats['new_tweets']}"
         f" | отфильтровано {stats['filtered']}"
+        f" | реплаев пропущено {stats['replies']}"
         f" | отправлено {stats['sent_album'] + stats['sent_single'] + stats['sent_text']}"
         f" (альбомов {stats['sent_album']}, с медиа {stats['sent_single']}, текстом {stats['sent_text']})"
         f" | ошибок отправки {stats['failed']}"
@@ -653,6 +656,23 @@ def _inc(stats, key):
     """Безопасное увеличение счётчика (если stats не передан — ничего не делает)."""
     if stats is not None:
         stats[key] += 1
+
+
+def is_reply(item, text):
+    """Определяет, является ли твит ответом (реплаем) другому пользователю.
+
+    Проверяем в двух источниках:
+    1. Поля, которые отдаёт скрапер (набор зависит от актора):
+       isReply, inReplyToId, inReplyToStatusId, inReplyToUsername, inReplyToUserId.
+    2. Резервный признак: реплай на X почти всегда начинается с @упоминания
+       (как у @ClutchNumbers: "@hoopswithavery You don't understand...").
+    """
+    for field in ("isReply", "inReplyToId", "inReplyToStatusId",
+                  "inReplyToUsername", "inReplyToUserId"):
+        if item.get(field):
+            return True
+    first = (text or "").lstrip()
+    return first.startswith("@")
 
 
 def process_tweet(item, sent_ids, stats=None):
@@ -668,6 +688,13 @@ def process_tweet(item, sent_ids, stats=None):
 
     _inc(stats, "new_tweets")
     raw_text = text or ""
+
+    # Фильтр реплаев: ответы другим пользователям не публикуются
+    if SKIP_REPLIES and is_reply(item, raw_text):
+        print(f"⏭ Твит {tweet_id} — ответ (реплай), пропущен")
+        save_sent_id(tweet_id)   # чтобы не проверять его при каждом запуске
+        _inc(stats, "replies")
+        return
 
     # Фильтр по стоп-фразам: твит пропускается, ID помечается как обработанный
     if any(phrase.lower() in raw_text.lower() for phrase in BLOCK_PHRASES):

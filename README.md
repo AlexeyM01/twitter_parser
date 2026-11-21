@@ -14,9 +14,15 @@ parser.py  ──►  Apify API  ──►  новые твиты за окно 
         │
         ├─► фильтр стоп-фраз (BLOCK_PHRASES) → пропуск ненужных твитов
         ├─► вырезание ссылок t.co из текста
-        ├─► скачивание медиа: прямой URL из данных Apify
-        │       └─► если не нашлось — резервный syndication API по tweet_id
-        ├─► отправка поста в Telegram (фото/видео + подпись, при ошибке — fallback на текст)
+        ├─► скачивание ВСЕХ медиа твита (до 10 — лимит альбома Telegram):
+        │       1) прямые URL фото/видео из данных Apify (pbs/video.twimg.com)
+        │       2) настоящие mp4 через резервный syndication API по tweet_id
+        │       3) превью-картинка твита (отправляется как фото)
+        ├─► отправка в Telegram:
+        │       1 медиа  → sendPhoto/sendVideo с подписью
+        │       2+ медиа → sendMediaGroup (альбом, подпись на первом файле;
+        │                   при ошибке альбома — fallback на отправку по одному)
+        │       0 медиа  → текстовый пост со ссылкой на оригинал
         └─► фиксация результата: sent_tweets.txt (ID отправленных) и
             parser_state.json (время последнего успешного запуска)
 ```
@@ -39,7 +45,8 @@ parser.py  ──►  Apify API  ──►  новые твиты за окно 
 
 | Файл | Описание |
 |---|---|
-| `parser.py` | Главный скрипт парсера. Вся логика: выборка твитов, фильтрация, медиа, отправка в Telegram. Настройки расписания — константы в начале файла, аккаунты — в `run_input.twitterHandles` |
+| `parser.py` | Главный скрипт парсера. Вся логика: выборка твитов, фильтрация, медиа, отправка в Telegram. Константы не содержит — берёт их из `config.py` |
+| `config.py` | **Вся конфигурация в одном месте**: секреты из `.env`, список аккаунтов мониторинга (`TWITTER_HANDLES`), стоп-фразы (`BLOCK_PHRASES`), параметры окна выборки и расписания, таймауты и лимиты. Менять настройки нужно только здесь |
 | `requirements.txt` | Зависимости Python: `requests`, `apify-client`. Установка: `pip install -r requirements.txt` |
 | `.gitignore` | Исключает из git секреты (`.env`), окружение (`venv/`), файлы состояния (`parser_state.json`, `sent_tweets.txt`) и кэш Python |
 
@@ -69,7 +76,7 @@ parser.py  ──►  Apify API  ──►  новые твиты за окно 
 
 | Файл | Описание |
 |---|---|
-| `deploy.sh` | Автоустановка «с нуля» на Ubuntu/Debian: проверяет `.env`, создаёт venv, ставит зависимости и копирует юниты systemd. Ожидает рядом `.env` и `parser.py`. Запуск: `sudo bash deploy.sh`. Используйте только при новой установке; для обновления кода достаточно `git pull` |
+| `deploy.sh` | Автоустановка «с нуля» на Ubuntu/Debian: проверяет `.env`, создаёт venv, ставит зависимости и копирует юниты systemd. Ожидает рядом `.env`, `parser.py` и `config.py`. Запуск: `sudo bash deploy.sh`. Используйте только при новой установке; для обновления кода достаточно `git pull` |
 
 ## Управление на сервере
 
@@ -92,7 +99,7 @@ cd /root/twitter_parser && git pull
 
 ## Настройка
 
-- **Аккаунты для мониторинга**: список в `run_input.twitterHandles` внутри `parser.py`.
-- **Стоп-фразы** (твит не публикуется): список `BLOCK_PHRASES` в `parser.py`.
-- **Интервал запуска**: константы `RUN_INTERVAL_MIN` / `OVERLAP_MIN` в `parser.py`
-  и `OnUnitActiveSec` в таймере (держите одинаковыми).
+- **Аккаунты для мониторинга**: список `TWITTER_HANDLES` в `config.py`.
+- **Стоп-фразы** (твит не публикуется): список `BLOCK_PHRASES` в `config.py`.
+- **Интервал запуска**: `RUN_INTERVAL_MIN` / `OVERLAP_MIN` в `config.py` (значение `RUN_INTERVAL_MIN` должно совпадать с `OnUnitActiveSec` в `twitter-parser.timer`).
+- **Таймауты и лимиты**: `SYNDICATION_TIMEOUT`, `DOWNLOAD_TIMEOUT`, `TG_*_TIMEOUT`, `MAX_ITEMS` и др. — в `config.py`.

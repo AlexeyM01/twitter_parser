@@ -35,6 +35,7 @@ from config import (
     TCO_RE,
     TG_BOT_TOKEN,
     TG_CHAT_ID,
+    TG_MEDIA_GROUP_LIMIT,
     TG_MEDIA_TIMEOUT,
     TG_TEXT_TIMEOUT,
     TRANSLATE_TO,
@@ -179,49 +180,57 @@ def pick_best_video_variant(variants):
     return None
 
 
-def get_media_info(item):
+def _extract_media_entry(m):
     """
-    Извлекает ПРЯМОЙ URL медиа из данных твита (без t.co).
-    Возвращает (url, type) или (None, None), если прямого URL нет.
+    (url, type) для ОДНОГО элемента media из данных твита, или (None, None).
+    """
+    if not isinstance(m, dict):
+        # Если медиа задано строкой и это не t.co — используем его
+        if isinstance(m, str) and "t.co" not in m:
+            return m, "photo"
+        return None, None
+
+    media_type = m.get("type", "photo")
+
+    # Для видео — только прямые mp4 из вариантов. НИКОГДА не отдаём превью
+    # с типом "video": sendVideo отвергнет JPEG.
+    if media_type in ("video", "animated_gif"):
+        video_info = m.get("video_info") or {}
+        variants = video_info.get("variants") or m.get("variants") or []
+        video_url = pick_best_video_variant(variants)
+        if not video_url:
+            video_url = m.get("video_url") or m.get("video")
+        if video_url and "t.co" not in video_url:
+            return video_url, "video"
+        return None, None
+
+    # Прямые URL картинки (pbs.twimg.com) — t.co не годится
+    photo_url = (
+        m.get("media_url_https")
+        or m.get("media_url")
+        or m.get("photo_url")
+    )
+    if photo_url and "t.co" not in photo_url:
+        return photo_url, "photo"
+
+    return None, None
+
+
+def get_all_media(item):
+    """
+    Извлекает ПРЯМЫЕ URL ВСЕХ медиа твита из данных Apify (без t.co).
+    Возвращает список (url, type) — в том же порядке, что в твите.
     """
     media_list = item.get("media") or item.get("mediaDetails") or []
     if not media_list or not isinstance(media_list, list):
-        return None, None
+        return []
 
-    first_media = media_list[0]
-    if not isinstance(first_media, dict):
-        # Если медиа задано строкой и это не t.co — используем его
-        if isinstance(first_media, str) and "t.co" not in first_media:
-            return first_media, "photo"
-        return None, None
-
-    media_type = first_media.get("type", "photo")
-
-    # 1. Для видео сначала пробуем варианты из video_info — там прямые ссылки на .mp4
-    if media_type in ("video", "animated_gif"):
-        video_info = first_media.get("video_info") or {}
-        variants = video_info.get("variants") or first_media.get("variants") or []
-        video_url = pick_best_video_variant(variants)
-        if not video_url:
-            video_url = first_media.get("video_url") or first_media.get("video")
-        if video_url and "t.co" not in video_url:
-            return video_url, "video"
-        # прямого видео-URL нет — возвращаем None, чтобы resolve_media
-        # попробовал syndication (там часто есть настоящие mp4).
-        # НИКОГДА не отдаём превью с типом "video": sendVideo отвергнет JPEG.
-        return None, None
-
-    # 2. Прямые URL картинки (pbs.twimg.com) — t.co не годится
-    photo_url = (
-        first_media.get("media_url_https")
-        or first_media.get("media_url")
-        or first_media.get("photo_url")
-    )
-    if photo_url and "t.co" not in photo_url and media_type not in ("video", "animated_gif"):
-        return photo_url, "photo"
-
-    # Прямого URL не нашли — сигнал вызывающему коду попробовать syndication API
-    return None, None
+    result = []
+    for m in media_list:
+        url, m_type = _extract_media_entry(m)
+        if url:
+            result.append((url, m_type))
+    return result
 
 
 def get_thumbnail(item):
@@ -239,38 +248,29 @@ def get_thumbnail(item):
 def fetch_media_via_syndication(tweet_id):
     """
     Резервный способ: публичный syndication API X.
-    Возвращает JSON твита с mediaDetails (media_url_https + video_info.variants),
-    даже если Apify отдал только t.co-ссылки.
+    Возвращает список (url, type) для ВСЕХ медиа твита (может быть пустым).
     """
     url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=x&lang=ru"
     try:
         resp = request_with_retry("GET", url, timeout=SYNDICATION_TIMEOUT)
         if resp.status_code != 200:
             print(f"  ⚠️ Syndication API вернул {resp.status_code}")
-            return None, None
+            return []
 
         data = resp.json()
         details = data.get("mediaDetails") or data.get("media") or []
         if not details or not isinstance(details, list):
-            return None, None
+            return []
 
-        m = details[0]
-        m_type = m.get("type", "photo")
-
-        if m_type in ("video", "animated_gif"):
-            variants = (m.get("video_info") or {}).get("variants") or []
-            video_url = pick_best_video_variant(variants)
-            if video_url:
-                return video_url, "video"
-
-        photo_url = m.get("media_url_https")
-        if photo_url:
-            return photo_url, "photo"
-
-        return None, None
+        result = []
+        for m in details:
+            m_url, m_type = _extract_media_entry(m)
+            if m_url:
+                result.append((m_url, m_type))
+        return result
     except Exception as e:  # noqa: BLE001
         print(f"  ❌ Ошибка syndication API: {e}")
-        return None, None
+        return []
 
 
 def resolve_tco_url(short_url):
@@ -426,31 +426,110 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
             return False
 
 
-def resolve_media(item, tweet_id):
+def resolve_all_media(item, tweet_id):
     """
-    Возвращает (media_path_ready_url, media_type).
+    Возвращает список (url, type) для ВСЕХ медиа твита.
     Стратегия:
-      1) прямой URL из данных Apify (pbs.twimg.com / video.twimg.com);
-      2) если там только t.co или ничего — syndication API по tweet_id.
+      1) прямые URL из данных Apify (pbs.twimg.com / video.twimg.com);
+      2) если их нет — syndication API по tweet_id (тоже все медиа);
+      3) если и там пусто — превью-картинка твита как фото.
     """
-    media_url, media_type = get_media_info(item)
+    media = get_all_media(item)
+    if media:
+        return media
 
-    if media_url:
-        return media_url, media_type
-
-    print("  🔁 Прямого URL нет, пробуем syndication API по tweet_id...")
-    synd_url, synd_type = fetch_media_via_syndication(tweet_id)
-    if synd_url:
-        print(f"  ✅ Найден медиа URL через syndication ({synd_type})")
-        return synd_url, synd_type
+    print("  🔁 Прямых URL нет, пробуем syndication API по tweet_id...")
+    synd_media = fetch_media_via_syndication(tweet_id)
+    if synd_media:
+        print(f"  ✅ Найдено медиа через syndication: {len(synd_media)} шт.")
+        return synd_media
 
     # Ни Apify, ни syndication не дали медиа — отправим хотя бы превью картинкой
     thumb = get_thumbnail(item)
     if thumb:
         print("  🖼️ Медиа не найдено — отправляем превью твита как фото")
-        return thumb, "photo"
+        return [(thumb, "photo")]
 
-    return None, None
+    return []
+
+
+def download_media_list(media_urls):
+    """
+    Скачивает список медиа (до TG_MEDIA_GROUP_LIMIT — лимит альбома Telegram).
+    Возвращает список (path, type) успешно скачанных файлов.
+    Одиночные неудачи пропускаются — отправим то, что скачалось.
+    """
+    downloaded = []
+    for media_url, media_type in media_urls[:TG_MEDIA_GROUP_LIMIT]:
+        path = download_media(media_url, media_type)
+        if path:
+            downloaded.append((path, media_type or "photo"))
+    return downloaded
+
+
+def send_media_group(caption, media_files):
+    """
+    Отправляет несколько медиа ОДНИМ альбомом (sendMediaGroup, до 10 файлов).
+    media_files — список (path, type). Подпись вешается на первый файл.
+    При ошибке альбома — fallback: отправка файлов по одному.
+    Возвращает True, если что-то успешно отправлено.
+    """
+    base_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+    n = len(media_files)
+    print(f"  📤 Отправка альбома из {n} медиа...")
+
+    # Собираем JSON-описание альбома: подпись — только на первом элементе
+    media_json = []
+    for i, (_, m_type) in enumerate(media_files):
+        entry = {
+            "type": "video" if m_type == "video" else "photo",
+            "media": f"attach://file{i}",
+        }
+        if i == 0:
+            entry["caption"] = caption[:CAPTION_SAFE]
+            entry["parse_mode"] = "HTML"
+        media_json.append(entry)
+
+    # Файлы передаются как multipart: file0, file1, ...
+    files = {}
+    handles = []
+    for i, (path, _) in enumerate(media_files):
+        fh = open(path, "rb")
+        handles.append(fh)
+        files[f"file{i}"] = (os.path.basename(path), fh)
+
+    try:
+        resp = request_with_retry(
+            "POST",
+            f"{base_url}/sendMediaGroup",
+            data={"chat_id": TG_CHAT_ID, "media": json.dumps(media_json)},
+            files=files,
+            timeout=TG_MEDIA_TIMEOUT,
+        )
+        if resp.ok:
+            print("  ✅ Альбом успешно отправлен!")
+            # Успех — подчищаем временные файлы
+            for path, _ in media_files:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            return True
+        print(f"  ❌ Telegram API ошибка (sendMediaGroup): {resp.status_code} — {resp.text[:300]}")
+    except Exception as e:
+        print(f"  ❌ Ошибка отправки альбома: {type(e).__name__}: {e}")
+    finally:
+        for fh in handles:
+            fh.close()
+
+    # Fallback: альбом не прошёл — отправляем по одному, чтобы пост не потерялся
+    print("  🔁 Fallback: отправка медиа по одному...")
+    ok_any = False
+    for i, (path, m_type) in enumerate(media_files):
+        cap = caption if i == 0 else "📎 Дополнительное медиа из того же поста"
+        if send_telegram_message(cap, path, m_type):
+            ok_any = True
+    return ok_any
 
 
 def run_parser():
@@ -517,16 +596,25 @@ def process_tweet(item, sent_ids):
     )
 
     print(f"\n=== Твит {tweet_id} ===")
-    media_url, media_type = resolve_media(item, tweet_id)
+    media_list = resolve_all_media(item, tweet_id)
 
-    media_path = None
-    if media_url:
-        print(f"🖼️  Медиа: {media_type}")
-        media_path = download_media(media_url, media_type)
+    media_files = []
+    if media_list:
+        print(f"🖼️  Медиа: {len(media_list)} шт. ({', '.join(t for _, t in media_list)})")
+        media_files = download_media_list(media_list)
+        if not media_files:
+            print("📝 Ни одно медиа не скачалось — отправим текстом")
     else:
         print("📝 Твит без доступного медиа")
 
-    sent_ok = send_telegram_message(formatted_post, media_path, media_type or "photo")
+    if len(media_files) >= 2:
+        # Несколько медиа — одним альбомом
+        sent_ok = send_media_group(formatted_post, media_files)
+    else:
+        # Одиночное медиа (или его отсутствие) — как раньше
+        media_path = media_files[0][0] if media_files else None
+        media_type = media_files[0][1] if media_files else "photo"
+        sent_ok = send_telegram_message(formatted_post, media_path, media_type)
 
     if sent_ok:
         # ID сохраняем ТОЛЬКО после успешной отправки.

@@ -28,7 +28,7 @@ PROXY_URL: str = os.getenv("PROXY_URL", "").strip()
 # Мониторинг Apify
 # ============================================================
 # Аккаунты X, за которыми следим
-TWITTER_HANDLES = ["NBA", "ShamsCharania", "TheDunkCentral"]
+TWITTER_HANDLES = ["NBA", "ShamsCharania", "TheDunkCentral", "TheNBACentel", "funakistats", "HaterReport", "statdefender", "BradeauxNBA", "ClutchNumbers"]
 # Язык перевода текста твитов скрапером ("ru" — переводить, "" — оставить как есть)
 TRANSLATE_TO = "ru"
 # Максимум твитов за один запуск (суммарно)

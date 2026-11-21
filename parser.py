@@ -772,7 +772,7 @@ def process_tweet(item, sent_ids, stats=None):
 
     media_files = []
     if media_list:
-        print(f"🖼️  Медиа: {len(media_list)} шт. ({', '.join(t for _, t in media_list)})")
+        print(f"🖼️  Медиа: {len(media_list)} шт. ({', '.join(t for _, t, _ in media_list)})")
         media_files = download_media_list(media_list)
         if not media_files:
             print("📝 Ни одно медиа не скачалось — отправим текстом")

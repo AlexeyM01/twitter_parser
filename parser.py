@@ -35,6 +35,7 @@ from config import (
     TCO_RE,
     TG_BOT_TOKEN,
     TG_CHAT_ID,
+    TG_MAX_UPLOAD_BYTES,
     TG_MEDIA_GROUP_LIMIT,
     TG_MEDIA_TIMEOUT,
     TG_TEXT_TIMEOUT,
@@ -161,34 +162,47 @@ def get_extension_from_content_type(content_type):
     return MIME_TO_EXT.get(mime)
 
 
-def pick_best_video_variant(variants):
-    """Выбирает вариант видео с максимальным битрейтом (предпочтительно mp4)"""
+def pick_video_variants(variants):
+    """
+    Возвращает список URL видео-вариантов, отсортированный ПО УБЫВАНИЮ битрейта
+    (только mp4, если есть; иначе любые с URL).
+    Первый элемент — лучшее качество. Перебор идёт вниз, пока файл не влезет
+    в лимит загрузки Telegram (TG_MAX_UPLOAD_BYTES).
+    """
     if not variants:
-        return None
+        return []
     mp4s = [
         v for v in variants
         if isinstance(v, dict)
         and "video/mp4" in (v.get("content_type") or v.get("contentType") or "")
-        and v.get("bitrate")
+        and v.get("url")
     ]
     if mp4s:
-        return max(mp4s, key=lambda v: v["bitrate"]).get("url")
-    # fallback: любой вариант с URL
-    for v in variants:
-        if isinstance(v, dict) and v.get("url"):
-            return v["url"]
-    return None
+        mp4s.sort(key=lambda v: v.get("bitrate") or 0, reverse=True)
+        return [v["url"] for v in mp4s]
+    # fallback: любые варианты с URL
+    return [v["url"] for v in variants if isinstance(v, dict) and v.get("url")]
+
+
+def pick_best_video_variant(variants):
+    """Лучший (самый качественный) вариант видео — первый из pick_video_variants."""
+    urls = pick_video_variants(variants)
+    return urls[0] if urls else None
 
 
 def _extract_media_entry(m):
     """
-    (url, type) для ОДНОГО элемента media из данных твита, или (None, None).
+    (candidates, type, thumb) для ОДНОГО элемента media из данных твита.
+    candidates — список URL-кандидатов для скачивания (для видео — все варианты
+    от лучшего качества к худшему, чтобы подобрать влезающее в лимит Telegram).
+    thumb — превью-картинка (крайний запасной вариант). Для фото thumb = сам URL.
+    Возвращает (None, None, None), если прямых URL нет.
     """
     if not isinstance(m, dict):
         # Если медиа задано строкой и это не t.co — используем его
         if isinstance(m, str) and "t.co" not in m:
-            return m, "photo"
-        return None, None
+            return [m], "photo", None
+        return None, None, None
 
     media_type = m.get("type", "photo")
 
@@ -197,12 +211,14 @@ def _extract_media_entry(m):
     if media_type in ("video", "animated_gif"):
         video_info = m.get("video_info") or {}
         variants = video_info.get("variants") or m.get("variants") or []
-        video_url = pick_best_video_variant(variants)
-        if not video_url:
-            video_url = m.get("video_url") or m.get("video")
-        if video_url and "t.co" not in video_url:
-            return video_url, "video"
-        return None, None
+        candidates = pick_video_variants(variants)
+        if not candidates:
+            single = m.get("video_url") or m.get("video")
+            candidates = [single] if single and "t.co" not in single else []
+        thumb = m.get("media_url_https") or m.get("media_url")
+        if candidates:
+            return candidates, "video", (thumb if thumb and "t.co" not in thumb else None)
+        return None, None, None
 
     # Прямые URL картинки (pbs.twimg.com) — t.co не годится
     photo_url = (
@@ -211,15 +227,16 @@ def _extract_media_entry(m):
         or m.get("photo_url")
     )
     if photo_url and "t.co" not in photo_url:
-        return photo_url, "photo"
+        return [photo_url], "photo", photo_url
 
-    return None, None
+    return None, None, None
 
 
 def get_all_media(item):
     """
     Извлекает ПРЯМЫЕ URL ВСЕХ медиа твита из данных Apify (без t.co).
-    Возвращает список (url, type) — в том же порядке, что в твите.
+    Возвращает список (candidates, type, thumb), где candidates — список URL
+    от лучшего качества к худшему (для видео) или одиночный URL (для фото).
     """
     media_list = item.get("media") or item.get("mediaDetails") or []
     if not media_list or not isinstance(media_list, list):
@@ -227,9 +244,9 @@ def get_all_media(item):
 
     result = []
     for m in media_list:
-        url, m_type = _extract_media_entry(m)
-        if url:
-            result.append((url, m_type))
+        candidates, m_type, thumb = _extract_media_entry(m)
+        if candidates:
+            result.append((candidates, m_type, thumb))
     return result
 
 
@@ -264,9 +281,9 @@ def fetch_media_via_syndication(tweet_id):
 
         result = []
         for m in details:
-            m_url, m_type = _extract_media_entry(m)
-            if m_url:
-                result.append((m_url, m_type))
+            m_candidates, m_type, m_thumb = _extract_media_entry(m)
+            if m_candidates:
+                result.append((m_candidates, m_type, m_thumb))
         return result
     except Exception as e:  # noqa: BLE001
         print(f"  ❌ Ошибка syndication API: {e}")
@@ -315,13 +332,34 @@ def download_media(url, media_type_hint):
 
     try:
         print("  📥 Загрузка файла...")
-        response = request_with_retry("GET", real_url, timeout=DOWNLOAD_TIMEOUT)
+        response = request_with_retry("GET", real_url, timeout=DOWNLOAD_TIMEOUT, stream=True)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "")
+
+        # Проверяем размер ДО скачивания тела: если файл больше лимита загрузки
+        # Telegram (50 МБ) — не качаем зря, sendVideo всё равно вернёт 413
+        declared_size = int(response.headers.get("Content-Length") or 0)
+        if declared_size > TG_MAX_UPLOAD_BYTES:
+            print(
+                f"  ⚠️ Файл больше лимита Telegram: {declared_size / 1024 / 1024:.1f} МБ"
+                f" > {TG_MAX_UPLOAD_BYTES / 1024 / 1024:.0f} МБ — пропуск (для видео будет превью)"
+            )
+            response.close()
+            return None
+
+        response.content  # скачиваем тело (stream=True)  # noqa: B018
         size = len(response.content)
 
         print(f"     Content-Type: {content_type} | Size: {size} bytes")
+
+        # Если Content-Length не был отдан — проверяем фактический размер
+        if size > TG_MAX_UPLOAD_BYTES:
+            print(
+                f"  ⚠️ Файл больше лимита Telegram: {size / 1024 / 1024:.1f} МБ — пропуск (для видео будет превью)"
+            )
+            response.close()
+            return None
 
         # Защита от получения HTML вместо медиа
         if "text/html" in content_type:
@@ -428,7 +466,7 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
 
 def resolve_all_media(item, tweet_id):
     """
-    Возвращает список (url, type) для ВСЕХ медиа твита.
+    Возвращает список (candidates, type, thumb) для ВСЕХ медиа твита.
     Стратегия:
       1) прямые URL из данных Apify (pbs.twimg.com / video.twimg.com);
       2) если их нет — syndication API по tweet_id (тоже все медиа);
@@ -448,22 +486,39 @@ def resolve_all_media(item, tweet_id):
     thumb = get_thumbnail(item)
     if thumb:
         print("  🖼️ Медиа не найдено — отправляем превью твита как фото")
-        return [(thumb, "photo")]
+        return [([thumb], "photo", thumb)]
 
     return []
 
 
-def download_media_list(media_urls):
+def download_media_list(media_entries):
     """
     Скачивает список медиа (до TG_MEDIA_GROUP_LIMIT — лимит альбома Telegram).
+    media_entries — список (candidates, type, thumb), где для видео candidates
+    перебираются от лучшего качества к худшему, пока файл не влезет
+    в лимит загрузки Telegram (TG_MAX_UPLOAD_BYTES).
+    Если ни один вариант не влез — скачивается превью-картинка кадра.
     Возвращает список (path, type) успешно скачанных файлов.
-    Одиночные неудачи пропускаются — отправим то, что скачалось.
     """
     downloaded = []
-    for media_url, media_type in media_urls[:TG_MEDIA_GROUP_LIMIT]:
-        path = download_media(media_url, media_type)
+    for candidates, media_type, thumb in media_entries[:TG_MEDIA_GROUP_LIMIT]:
+        path = None
+        for candidate_url in candidates:
+            path = download_media(candidate_url, media_type)
+            if path:
+                break
+            # Вариант не прошёл (например, слишком большой) — пробуем качество ниже
+
         if path:
             downloaded.append((path, media_type or "photo"))
+            continue
+
+        # Ни один вариант не влез в лимит — отправляем превью-кадр как фото
+        if thumb and thumb not in candidates:
+            print("  🖼️ Ни один вариант видео не влез в лимит — отправляем превью-кадр как фото")
+            thumb_path = download_media(thumb, "photo")
+            if thumb_path:
+                downloaded.append((thumb_path, "photo"))
     return downloaded
 
 

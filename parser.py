@@ -9,6 +9,17 @@ from datetime import UTC, datetime, timedelta
 import requests
 from apify_client import ApifyClient
 
+# === ФИЛЬТРАЦИЯ ===
+# Стоп-фразы: твиты с ними не публикуются (сравнение без учёта регистра)
+BLOCK_PHRASES = [
+    "Tap to watch:",
+    # добавляйте свои фразы через запятую, например:
+    # "Learn more", "Sponsored",
+]
+
+# Регулярка для вырезания ссылок t.co из текста твита
+TCO_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
+
 # === КОНФИГУРАЦИЯ ===
 APIFY_TOKEN: str = os.getenv("APIFY_TOKEN", "").strip()
 ACTOR_ID: str = os.getenv("ACTOR_ID", "").strip()
@@ -52,21 +63,6 @@ else:
     SESSION.trust_env = False
     print("🌐 Работаем без прокси (системные прокси-настройки игнорируются)")
 
-
-# Стоп-фразы: твиты с ними не публикуются (сравнение без учёта регистра)
-BLOCK_PHRASES = [
-    "Tap to watch",
-    # добавляйте свои фразы через запятую, например:
-    # "Learn more", "Sponsored",
-]
-
-# Фразы, строчки с которыми не добавляются в пост
-DELETE_LINES_WITH_PHRASES = [
-    "https://t.co/",
-]
-
-# Регулярка для вырезания ссылок t.co из текста твита
-TCO_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
 
 def request_with_retry(method, url, retries=MAX_RETRIES, delay=RETRY_DELAY_SEC, **kwargs):
     """Обёртка с ретраями поверх сессии. Возвращает response или выбрасывает исключение."""
@@ -213,7 +209,10 @@ def get_media_info(item):
             video_url = first_media.get("video_url") or first_media.get("video")
         if video_url and "t.co" not in video_url:
             return video_url, "video"
-        # прямого видео-URL нет — ниже попробуем thumbnail или syndication
+        # прямого видео-URL нет — возвращаем None, чтобы resolve_media
+        # попробовал syndication (там часто есть настоящие mp4).
+        # НИКОГДА не отдаём превью с типом "video": sendVideo отвергнет JPEG.
+        return None, None
 
     # 2. Прямые URL картинки (pbs.twimg.com) — t.co не годится
     photo_url = (
@@ -221,11 +220,23 @@ def get_media_info(item):
         or first_media.get("media_url")
         or first_media.get("photo_url")
     )
-    if photo_url and "t.co" not in photo_url:
-        return photo_url, "photo" if media_type not in ("video", "animated_gif") else "video"
+    if photo_url and "t.co" not in photo_url and media_type not in ("video", "animated_gif"):
+        return photo_url, "photo"
 
     # Прямого URL не нашли — сигнал вызывающему коду попробовать syndication API
     return None, None
+
+
+def get_thumbnail(item):
+    """Превью-картинка твита — крайний запасной вариант, если и Apify, и
+    syndication не дали ни mp4, ни фото. Отправим её как фото, а не текстом."""
+    media_list = item.get("media") or item.get("mediaDetails") or []
+    if media_list and isinstance(media_list[0], dict):
+        url = (media_list[0].get("media_url_https")
+               or media_list[0].get("media_url"))
+        if url and "t.co" not in url:
+            return url
+    return None
 
 
 def fetch_media_via_syndication(tweet_id):
@@ -436,6 +447,12 @@ def resolve_media(item, tweet_id):
         print(f"  ✅ Найден медиа URL через syndication ({synd_type})")
         return synd_url, synd_type
 
+    # Ни Apify, ни syndication не дали медиа — отправим хотя бы превью картинкой
+    thumb = get_thumbnail(item)
+    if thumb:
+        print("  🖼️ Медиа не найдено — отправляем превью твита как фото")
+        return thumb, "photo"
+
     return None, None
 
 
@@ -491,7 +508,7 @@ def process_tweet(item, sent_ids):
 
     tweet_url = item.get("url") or f"https://x.com/{author}/status/{tweet_id}"
 
-    # Вырезаем ссылки t.co и подчищаем лишние пробелы/переносы
+    # Вырезаем ссылки t.co и подчищаем лишние пробелы
     clean_text = TCO_RE.sub("", raw_text).strip()
     clean_text = re.sub(r" {2,}", " ", clean_text)
     safe_text = html.escape(clean_text)

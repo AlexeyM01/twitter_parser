@@ -1,0 +1,15 @@
+[Unit]
+Description=Twitter/X tweets -> Telegram parser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/twitter_parser
+EnvironmentFile=/root/twitter_parser/.env
+ExecStart=/root/twitter_parser/venv/bin/python /root/twitter_parser/parser.py
+# Скрипт + скачивание медиа + отправка в Telegram: 10 минут с запасом
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal

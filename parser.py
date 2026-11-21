@@ -294,6 +294,40 @@ def fetch_media_via_syndication(tweet_id):
         return []
 
 
+def fetch_media_via_fxtwitter(tweet_id):
+    """
+    Четвёртый резерв: публичный API fxtwitter (api.fxtwitter.com).
+    Стабильно отдаёт прямые ссылки на фото и видео, когда Apify вернул
+    только t.co, а syndication не ответил / не дал медиа.
+    Возвращает список (candidates, type, thumb).
+    """
+    url = f"https://api.fxtwitter.com/status/{tweet_id}"
+    try:
+        resp = request_with_retry("GET", url, timeout=SYNDICATION_TIMEOUT)
+        if resp.status_code != 200:
+            print(f"  ⚠️ fxtwitter API вернул {resp.status_code}")
+            return []
+
+        data = resp.json()
+        tweet = data.get("tweet") or {}
+        media = tweet.get("media") or {}
+
+        result = []
+        for m in (media.get("photos") or []):
+            u = m.get("url")
+            if u and "t.co" not in u:
+                result.append(([u], "photo", u))
+        for m in (media.get("videos") or []):
+            u = m.get("url")
+            if u and "t.co" not in u:
+                thumb = m.get("thumbnail_url") or m.get("thumbnail")
+                result.append(([u], "video", thumb if thumb and "t.co" not in thumb else None))
+        return result
+    except Exception as e:  # noqa: BLE001
+        print(f"  ❌ Ошибка fxtwitter API: {e}")
+        return []
+
+
 def resolve_tco_url(short_url):
     """
     Преобразует короткую ссылку t.co в реальный URL.
@@ -473,8 +507,9 @@ def resolve_all_media(item, tweet_id):
     Возвращает список (candidates, type, thumb) для ВСЕХ медиа твита.
     Стратегия:
       1) прямые URL из данных Apify (pbs.twimg.com / video.twimg.com);
-      2) если их нет — syndication API по tweet_id (тоже все медиа);
-      3) если и там пусто — превью-картинка твита как фото.
+      2) если их нет — syndication API по tweet_id;
+      3) если и там пусто — fxtwitter API (надёжный публичный резерв);
+      4) и только потом превью-картинка твита как фото.
     """
     media = get_all_media(item)
     if media:
@@ -486,7 +521,13 @@ def resolve_all_media(item, tweet_id):
         print(f"  ✅ Найдено медиа через syndication: {len(synd_media)} шт.")
         return synd_media
 
-    # Ни Apify, ни syndication не дали медиа — отправим хотя бы превью картинкой
+    print("  🔁 Syndication пуст, пробуем fxtwitter API...")
+    fx_media = fetch_media_via_fxtwitter(tweet_id)
+    if fx_media:
+        print(f"  ✅ Найдено медиа через fxtwitter: {len(fx_media)} шт.")
+        return fx_media
+
+    # Ничто не дало медиа — отправим хотя бы превью картинкой
     thumb = get_thumbnail(item)
     if thumb:
         print("  🖼️ Медиа не найдено — отправляем превью твита как фото")

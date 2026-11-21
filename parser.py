@@ -9,40 +9,37 @@ from datetime import UTC, datetime, timedelta
 import requests
 from apify_client import ApifyClient
 
-# === ФИЛЬТРАЦИЯ ===
-# Стоп-фразы: твиты с ними не публикуются (сравнение без учёта регистра)
-BLOCK_PHRASES = [
-    "Tap to watch",
-    "Join us in wishing",
-    # добавляйте свои фразы через запятую, например:
-]
-
-# Регулярка для вырезания ссылок t.co из текста твита
-TCO_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
-
-# === КОНФИГУРАЦИЯ ===
-APIFY_TOKEN: str = os.getenv("APIFY_TOKEN", "").strip()
-ACTOR_ID: str = os.getenv("ACTOR_ID", "").strip()
-TG_BOT_TOKEN: str = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID: str = os.getenv("TG_CHAT_ID", "").strip()
-
-# Прокси: если задан — весь исходящий трафик идёт через него;
-# если НЕ задан — системные прокси (реестр Windows / HTTP_PROXY) полностью игнорируются.
-# Формат: http://127.0.0.1:10809 или socks5://127.0.0.1:1080
-PROXY_URL: str = os.getenv("PROXY_URL", "").strip()
-
-# Ретраи и таймауты
-MAX_RETRIES = 3          # попыток на запрос (Telegram, syndication, скачивание медиа)
-RETRY_DELAY_SEC = 5      # пауза между попытками
-
-SENT_IDS_FILE = "sent_tweets.txt"
-STATE_FILE = "parser_state.json"  # хранит время последнего успешного запуска
-
-# === Настройки расписания (согласованы с systemd-таймером каждые 10 минут) ===
-RUN_INTERVAL_MIN = 10       # период запуска парсера
-OVERLAP_MIN = 2             # перекрытие окна — защита от твитов, опубликованных на границе запусков
-MAX_LOOKBACK_MIN = 360      # потолок «догоняющего» окна после простоя (6 часов), чтобы не спамить старьем
-FIRST_RUN_WINDOW_MIN = 15   # окно самого первого запуска (пока нет файла состояния)
+# Вся конфигурация (секреты, списки, лимиты, таймауты) — в config.py
+from config import (
+    ACTOR_ID,
+    APIFY_TOKEN,
+    BLOCK_PHRASES,
+    CAPTION_LIMIT,
+    CAPTION_SAFE,
+    DOWNLOAD_TIMEOUT,
+    FIRST_RUN_WINDOW_MIN,
+    MAX_ITEMS,
+    MAX_ITEMS_PER_TARGET,
+    MAX_LOOKBACK_MIN,
+    MAX_RETRIES,
+    MEDIA_MIN_SIZE_PHOTO,
+    MEDIA_MIN_SIZE_VIDEO,
+    OVERLAP_MIN,
+    PROXY_URL,
+    QUERY_TYPE,
+    RESOLVE_TCO_TIMEOUT,
+    RETRY_DELAY_SEC,
+    SENT_IDS_FILE,
+    STATE_FILE,
+    SYNDICATION_TIMEOUT,
+    TCO_RE,
+    TG_BOT_TOKEN,
+    TG_CHAT_ID,
+    TG_MEDIA_TIMEOUT,
+    TG_TEXT_TIMEOUT,
+    TRANSLATE_TO,
+    TWITTER_HANDLES,
+)
 
 # Глобальная сессия для сохранения cookies и заголовков между запросами
 SESSION = requests.Session()
@@ -247,7 +244,7 @@ def fetch_media_via_syndication(tweet_id):
     """
     url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=x&lang=ru"
     try:
-        resp = request_with_retry("GET", url, timeout=20)
+        resp = request_with_retry("GET", url, timeout=SYNDICATION_TIMEOUT)
         if resp.status_code != 200:
             print(f"  ⚠️ Syndication API вернул {resp.status_code}")
             return None, None
@@ -283,7 +280,7 @@ def resolve_tco_url(short_url):
     поэтому используем GET со stream=True.
     """
     try:
-        resp = request_with_retry("GET", short_url, stream=True, allow_redirects=True, timeout=15)
+        resp = request_with_retry("GET", short_url, stream=True, allow_redirects=True, timeout=RESOLVE_TCO_TIMEOUT)
         real_url = str(resp.url)
         resp.close()  # не скачиваем тело ответа
 
@@ -318,7 +315,7 @@ def download_media(url, media_type_hint):
 
     try:
         print("  📥 Загрузка файла...")
-        response = request_with_retry("GET", real_url, timeout=30)
+        response = request_with_retry("GET", real_url, timeout=DOWNLOAD_TIMEOUT)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "")
@@ -337,7 +334,7 @@ def download_media(url, media_type_hint):
             ext = ".mp4" if media_type_hint == "video" else ".jpg"
 
         # Проверка минимального размера
-        min_size = 1024 if media_type_hint == "photo" else 10240
+        min_size = MEDIA_MIN_SIZE_PHOTO if media_type_hint == "photo" else MEDIA_MIN_SIZE_VIDEO
         if size < min_size:
             print(f"  ❌ Файл слишком мал ({size} байт), возможно поврежден")
             return None
@@ -368,8 +365,8 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
     """
     base_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-    # Обрезка подписи до лимита Telegram (1024 символа)
-    caption = text[:1020] + "..." if len(text) > 1024 else text
+    # Обрезка подписи до лимита Telegram
+    caption = text[:CAPTION_SAFE] + "..." if len(text) > CAPTION_LIMIT else text
 
     if media_path and os.path.exists(media_path):
         file_size = os.path.getsize(media_path)
@@ -390,7 +387,7 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
                     "caption": caption,
                     "parse_mode": "HTML",
                 }
-                resp = request_with_retry("POST", endpoint, data=data, files=files, timeout=90)
+                resp = request_with_retry("POST", endpoint, data=data, files=files, timeout=TG_MEDIA_TIMEOUT)
 
             if resp.ok:
                 print("  ✅ Медиа успешно отправлено!")
@@ -418,7 +415,7 @@ def send_telegram_message(text, media_path=None, media_type="photo"):
             "disable_web_page_preview": False,
         }
         try:
-            resp = request_with_retry("POST", f"{base_url}/sendMessage", data=payload, timeout=60)
+            resp = request_with_retry("POST", f"{base_url}/sendMessage", data=payload, timeout=TG_TEXT_TIMEOUT)
             if not resp.ok:
                 print(f"  ❌ Telegram API: {resp.status_code} — {resp.text[:300]}")
                 return False
@@ -462,11 +459,11 @@ def run_parser():
 
     # Окно выборки считается от последнего УСПЕШНОГО запуска (см. compute_since_time)
     run_input = {
-        "twitterHandles": ["NBA", "ShamsCharania", "TheDunkCentral"],
-        "translateTo": "ru",
-        "maxItems": 50,
-        "queryType": "Latest",
-        "maxItemsPerTarget": 5,
+        "twitterHandles": TWITTER_HANDLES,
+        "translateTo": TRANSLATE_TO,
+        "maxItems": MAX_ITEMS,
+        "queryType": QUERY_TYPE,
+        "maxItemsPerTarget": MAX_ITEMS_PER_TARGET,
         "sinceTime": compute_since_time(),
     }
 

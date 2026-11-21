@@ -82,6 +82,7 @@ validate_env "$LOCAL_ENV"
 echo "=== [3/5] Копирование файлов в $APP_DIR ==="
 mkdir -p "$APP_DIR"
 cp "$SCRIPT_DIR/parser.py" "$APP_DIR/parser.py"
+cp "$SCRIPT_DIR/config.py" "$APP_DIR/config.py"
 
 echo "=== [4/5] Установка зависимостей ==="
 if [ ! -d "$APP_DIR/venv" ]; then

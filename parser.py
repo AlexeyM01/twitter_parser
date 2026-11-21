@@ -494,7 +494,7 @@ def send_media_group(caption, media_files):
     files = {}
     handles = []
     for i, (path, _) in enumerate(media_files):
-        fh = open(path, "rb")
+        fh = open(path, "rb")  # noqa: SIM115
         handles.append(fh)
         files[f"file{i}"] = (os.path.basename(path), fh)
 
@@ -516,7 +516,7 @@ def send_media_group(caption, media_files):
                     pass
             return True
         print(f"  ❌ Telegram API ошибка (sendMediaGroup): {resp.status_code} — {resp.text[:300]}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  ❌ Ошибка отправки альбома: {type(e).__name__}: {e}")
     finally:
         for fh in handles:
@@ -557,29 +557,68 @@ def run_parser():
     # а следующий запуск перекроет окно на OVERLAP_MIN минут назад.
     save_last_run_ts()
 
+    # Счётчики запуска — попадут в итоговую строку лога
+    stats = {
+        "total": 0,          # всего элементов из выборки
+        "duplicates": 0,     # пропущены как уже отправленные
+        "new_tweets": 0,     # новых (не в sent_ids)
+        "filtered": 0,       # отфильтрованы по стоп-фразам
+        "sent_album": 0,     # отправлено альбомом (2+ медиа)
+        "sent_single": 0,    # отправлено с одиночным медиа
+        "sent_text": 0,      # отправлено только текстом
+        "failed": 0,         # НЕ отправлены (повтор при следующем запуске)
+        "errors": 0,         # упали с исключением при обработке
+    }
+
     for item in reversed(dataset_items):
+        stats["total"] += 1
         try:
-            process_tweet(item, sent_ids)
+            process_tweet(item, sent_ids, stats)
         except Exception as e:  # noqa: BLE001
             # Один проблемный твит не должен останавливать весь запуск
+            stats["errors"] += 1
             print(f"❌ Ошибка обработки твита {item.get('id')}: {type(e).__name__}: {e}\n")
             continue
 
+    # Итоговая сводка запуска — всегда печатается последней, легко ищется по "📊"
+    print(
+        "\n📊 Итог запуска:"
+        f" получено {stats['total']}"
+        f" | дублей пропущено {stats['duplicates']}"
+        f" | новых {stats['new_tweets']}"
+        f" | отфильтровано {stats['filtered']}"
+        f" | отправлено {stats['sent_album'] + stats['sent_single'] + stats['sent_text']}"
+        f" (альбомов {stats['sent_album']}, с медиа {stats['sent_single']}, текстом {stats['sent_text']})"
+        f" | ошибок отправки {stats['failed']}"
+        f" | исключений {stats['errors']}"
+    )
 
-def process_tweet(item, sent_ids):
+
+def _inc(stats, key):
+    """Безопасное увеличение счётчика (если stats не передан — ничего не делает)."""
+    if stats is not None:
+        stats[key] += 1
+
+
+def process_tweet(item, sent_ids, stats=None):
     author = item.get("author", {}).get("name", "Unknown") if isinstance(item.get("author"), dict) else "Unknown"
     text = item.get("text")
     tweet_id = str(item.get("id"))
 
-    if not tweet_id or tweet_id in sent_ids:
+    if not tweet_id:
+        return
+    if tweet_id in sent_ids:
+        _inc(stats, "duplicates")
         return
 
+    _inc(stats, "new_tweets")
     raw_text = text or ""
 
     # Фильтр по стоп-фразам: твит пропускается, ID помечается как обработанный
     if any(phrase.lower() in raw_text.lower() for phrase in BLOCK_PHRASES):
         print(f"⏭ Твит {tweet_id} отфильтрован по стоп-фразе")
         save_sent_id(tweet_id)   # чтобы не проверять его при каждом запуске
+        _inc(stats, "filtered")
         return
 
     tweet_url = item.get("url") or f"https://x.com/{author}/status/{tweet_id}"
@@ -610,19 +649,23 @@ def process_tweet(item, sent_ids):
     if len(media_files) >= 2:
         # Несколько медиа — одним альбомом
         sent_ok = send_media_group(formatted_post, media_files)
+        sent_kind = "sent_album"
     else:
         # Одиночное медиа (или его отсутствие) — как раньше
         media_path = media_files[0][0] if media_files else None
         media_type = media_files[0][1] if media_files else "photo"
         sent_ok = send_telegram_message(formatted_post, media_path, media_type)
+        sent_kind = "sent_single" if media_path else "sent_text"
 
     if sent_ok:
         # ID сохраняем ТОЛЬКО после успешной отправки.
         # Если упало (сеть/прокси/Telegram) — не сохраняем, и следующий запуск
         # (окно перекрывается на OVERLAP_MIN) повторит попытку.
         save_sent_id(tweet_id)
+        _inc(stats, sent_kind)
         print(f"✅ Обработан твит {tweet_id}\n")
     else:
+        _inc(stats, "failed")
         print(f"⏳ Твит {tweet_id} НЕ отправлен — повторим при следующем запуске\n")
 
     time.sleep(2)

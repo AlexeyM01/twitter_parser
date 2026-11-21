@@ -89,6 +89,9 @@ systemctl start twitter-parser.service
 journalctl -u twitter-parser.service -f        # живой лог
 journalctl -u twitter-parser.service --since today   # лог за день
 
+# Итоги всех запусков за день (счётчики: дубли, отфильтровано, отправлено, ошибки)
+journalctl -u twitter-parser.service --since today | grep "Итог запуска"
+
 # Включить / выключить автозапуск
 systemctl enable --now twitter-parser.timer
 systemctl disable --now twitter-parser.timer

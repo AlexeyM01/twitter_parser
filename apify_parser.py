@@ -1,6 +1,7 @@
 import html
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import UTC, datetime, timedelta
@@ -51,6 +52,21 @@ else:
     SESSION.trust_env = False
     print("🌐 Работаем без прокси (системные прокси-настройки игнорируются)")
 
+
+# Стоп-фразы: твиты с ними не публикуются (сравнение без учёта регистра)
+BLOCK_PHRASES = [
+    "Tap to watch:",
+    # добавляйте свои фразы через запятую, например:
+    # "Learn more", "Sponsored",
+]
+
+# Фразы, строчки с которыми не добавляются в пост
+DELETE_LINES_WITH_PHRASES = [
+    "https://t.co/",
+]
+
+# Регулярка для вырезания ссылок t.co из текста твита
+TCO_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
 
 def request_with_retry(method, url, retries=MAX_RETRIES, delay=RETRY_DELAY_SEC, **kwargs):
     """Обёртка с ретраями поверх сессии. Возвращает response или выбрасывает исключение."""
@@ -465,8 +481,20 @@ def process_tweet(item, sent_ids):
     if not tweet_id or tweet_id in sent_ids:
         return
 
+    raw_text = text or ""
+
+    # Фильтр по стоп-фразам: твит пропускается, ID помечается как обработанный
+    if any(phrase.lower() in raw_text.lower() for phrase in BLOCK_PHRASES):
+        print(f"⏭ Твит {tweet_id} отфильтрован по стоп-фразе")
+        save_sent_id(tweet_id)   # чтобы не проверять его при каждом запуске
+        return
+
     tweet_url = item.get("url") or f"https://x.com/{author}/status/{tweet_id}"
-    safe_text = html.escape(text or "")
+
+    # Вырезаем ссылки t.co и подчищаем лишние пробелы/переносы
+    clean_text = TCO_RE.sub("", raw_text).strip()
+    clean_text = re.sub(r" {2,}", " ", clean_text)
+    safe_text = html.escape(clean_text)
 
     formatted_post = (
         f"🐦 <b>Новый пост от @{html.escape(author)}</b>\n\n"

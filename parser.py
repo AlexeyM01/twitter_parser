@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from apify_client import ApifyClient
@@ -43,6 +43,9 @@ from config import (
     TRANSLATE_TO,
     TWITTER_HANDLES,
 )
+
+UTC = timezone.utc  # noqa: UP017
+
 
 # Глобальная сессия для сохранения cookies и заголовков между запросами
 SESSION = requests.Session()
@@ -605,7 +608,14 @@ def run_parser():
     print("🚀 Запускаем скрапер в Apify...")
     run = client.actor(ACTOR_ID).call(run_input=run_input)
 
-    dataset_items = client.dataset(run.default_dataset_id).list_items().items
+    # Совместимость версий apify-client:
+    #   новые (>=1.7) возвращают объект Run -> run.default_dataset_id
+    #   старые возвращают dict        -> run["defaultDatasetId"]
+    if isinstance(run, dict):
+        dataset_id = run.get("defaultDatasetId") or run.get("default_dataset_id")
+    else:
+        dataset_id = run.default_dataset_id
+    dataset_items = client.dataset(dataset_id).list_items().items
     print(f"📦 Получено {len(dataset_items)} элементов\n")
 
     # Выборка прошла успешно — фиксируем время этого запуска как опорное.

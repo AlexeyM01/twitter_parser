@@ -12,7 +12,7 @@ from apify_client import ApifyClient
 # === ФИЛЬТРАЦИЯ ===
 # Стоп-фразы: твиты с ними не публикуются (сравнение без учёта регистра)
 BLOCK_PHRASES = [
-    "Tap to watch:",
+    "Tap to watch",
     "Join us in wishing",
     # добавляйте свои фразы через запятую, например:
 ]

@@ -47,6 +47,7 @@ TG_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 BLOCK_PHRASES = [
     "Tap to watch",
     "Join us in wishing",
+    "Tap into",
     # добавляйте свои фразы через запятую, например:
     # "Learn more", "Sponsored",
 ]

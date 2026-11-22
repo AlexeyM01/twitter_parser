@@ -31,6 +31,7 @@ from config import (
     RETRY_DELAY_SEC,
     SENT_IDS_FILE,
     SKIP_REPLIES,
+    SKIP_RETWEETS,
     STATE_FILE,
     SYNDICATION_TIMEOUT,
     TCO_RE,
@@ -671,6 +672,7 @@ def run_parser():
         "new_tweets": 0,     # новых (не в sent_ids)
         "filtered": 0,       # отфильтрованы по стоп-фразам
         "replies": 0,        # пропущены как ответы (реплаи)
+        "retweets": 0,       # пропущены как репосты (ретвиты)
         "sent_album": 0,     # отправлено альбомом (2+ медиа)
         "sent_single": 0,    # отправлено с одиночным медиа
         "sent_text": 0,      # отправлено только текстом
@@ -696,6 +698,7 @@ def run_parser():
         f" | новых {stats['new_tweets']}"
         f" | отфильтровано {stats['filtered']}"
         f" | реплаев пропущено {stats['replies']}"
+        f" | ретвитов пропущено {stats['retweets']}"
         f" | отправлено {stats['sent_album'] + stats['sent_single'] + stats['sent_text']}"
         f" (альбомов {stats['sent_album']}, с медиа {stats['sent_single']}, текстом {stats['sent_text']})"
         f" | ошибок отправки {stats['failed']}"
@@ -726,6 +729,23 @@ def is_reply(item, text):
     return first.startswith("@")
 
 
+def is_retweet(item, text):
+    """Определяет, является ли твит репостом (ретвитом) чужого поста.
+
+    Признаки:
+    1. Поля от скрапера (набор зависит от актора): isRetweet, retweetedStatusId,
+       retweeted_status_id, isNativeRetweet.
+    2. Классический маркер: текст начинается с "RT @user:" — как у
+       @HaterReport: "RT @currypistonn: LSU lost 5 games...".
+    """
+    for field in ("isRetweet", "retweetedStatusId", "retweeted_status_id",
+                  "isNativeRetweet"):
+        if item.get(field):
+            return True
+    first = (text or "").lstrip()
+    return first.startswith("RT @")
+
+
 def process_tweet(item, sent_ids, stats=None):
     author = item.get("author", {}).get("name", "Unknown") if isinstance(item.get("author"), dict) else "Unknown"
     text = item.get("text")
@@ -739,6 +759,13 @@ def process_tweet(item, sent_ids, stats=None):
 
     _inc(stats, "new_tweets")
     raw_text = text or ""
+
+    # Фильтр репостов: чужие посты, перепощенные monitored-аккаунтом, не публикуются
+    if SKIP_RETWEETS and is_retweet(item, raw_text):
+        print(f"⏭ Твит {tweet_id} — ретвит чужого поста, пропущен")
+        save_sent_id(tweet_id)   # чтобы не проверять его при каждом запуске
+        _inc(stats, "retweets")
+        return
 
     # Фильтр реплаев: ответы другим пользователям не публикуются
     if SKIP_REPLIES and is_reply(item, raw_text):

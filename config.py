@@ -59,6 +59,7 @@ TCO_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
 # inReplyToId/isReply от скрапера. True — не публиковать ответы,
 # False — публиковать всё подряд, включая ответы.
 SKIP_REPLIES = True
+SKIP_RETWEETS = True
 
 # ============================================================
 # Расписание (согласовано с systemd-таймером: каждые 10 минут)
